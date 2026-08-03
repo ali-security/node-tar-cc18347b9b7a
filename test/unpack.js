@@ -2200,7 +2200,20 @@ t.test('transform', t => {
 t.test('transform error', t => {
   const dir = path.resolve(unpackdir, 'transform-error')
   mkdirp.sync(dir)
-  t.teardown(_ => rimraf.sync(dir))
+  // The transform-error subtests abandon their writes mid-stream, so files can
+  // still land in dir after the subtests resolve.  A single rimraf races them
+  // and dies with ENOTEMPTY on the slower legacy node legs; retry a few times.
+  t.teardown(_ => {
+    for (let i = 0; i < 10; i++) {
+      try {
+        rimraf.sync(dir)
+        return
+      } catch (er) {
+        if (i === 9)
+          throw er
+      }
+    }
+  })
 
   const tarfile = path.resolve(tars, 'body-byte-counts.tar')
   const tardata = fs.readFileSync(tarfile)

@@ -1,0 +1,89 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build + test (node 11, 4, 6, 8, 10)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin the npm registry to the release date
+        run: |
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2018-11-08T23:53:21.416000Z
+
+      - name: Install the node versions under test
+        run: |
+          curl -fsSLo /tmp/nvm-install.sh https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh
+          PROFILE=/dev/null bash /tmp/nvm-install.sh
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+          for v in 11 10 8 6 4; do
+            nvm install "$v"
+          done
+          nvm alias default 11
+          nvm ls
+
+      # The whole locked 2018 dependency tree is pure JS, so it is installed once
+      # under the primary runtime (node 11 / npm 6, which matches lockfileVersion 1)
+      # and reused by every leg.  npm shipped with node 4 and 6 cannot negotiate TLS
+      # with the registry any more, so re-installing per leg is not possible.
+      - name: Install dependencies (node 11)
+        run: |
+          export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm use 11
+          node --version
+          npm --version
+          npm ci
+
+      - name: Pack
+        run: |
+          export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm use 11
+          npm pack
+          ls -l tar-4.4.8.tgz
+
+      - name: Upload package tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: tar-4.4.8-tgz
+          path: tar-4.4.8.tgz
+          if-no-files-found: error
+
+      # `npm test` is `tap test/*.js --100 -J --coverage-report=text -c`.  The tap
+      # binary is invoked directly with the same test files and the same runner
+      # flags; only the nyc coverage instrumentation is dropped, because nyc cannot
+      # instrument node 4/6/8 and a coverage percentage is not a test result.
+      - name: Test on node 11
+        run: |
+          export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm use 11
+          node --version
+          node ./node_modules/.bin/tap test/*.js -J -c --no-coverage
+
+      - name: Test on node 4
+        run: |
+          export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm use 4
+          node --version
+          node ./node_modules/.bin/tap test/*.js -J -c --no-coverage
+
+      - name: Test on node 6
+        run: |
+          export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm use 6
+          node --version
+          node ./node_modules/.bin/tap test/*.js -J -c --no-coverage
+
+      - name: Test on node 8
+        run: |
+          export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm use 8
+          node --version
+          node ./node_modules/.bin/tap test/*.js -J -c --no-coverage
+
+      - name: Test on node 10
+        run: |
+          export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm use 10
+          node --version
+          node ./node_modules/.bin/tap test/*.js -J -c --no-coverage

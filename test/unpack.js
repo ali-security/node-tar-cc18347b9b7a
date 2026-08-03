@@ -1976,10 +1976,13 @@ t.test('set owner', t => {
           if (!warned) {
             warned = true
             t.equal(er, poop)
-            t.end()
           }
         }
       })
+      // the extraction has to be allowed to finish before the teardown
+      // removes the cwd out from under the entries that are still in
+      // flight, or one of them raises an unhandled CwdError
+      u.on('close', _ => t.end())
       u.end(data)
     })
 
@@ -3572,6 +3575,217 @@ t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', t => {
       onwarn: onwarn
     }).end(data)
     check(t, cwd)
+  })
+
+  t.end()
+})
+
+t.test('no linking through a symlink', t => {
+  // A link target that resolves through a symbolic link already on disk
+  // lands outside of the extraction directory, even though neither the
+  // entry path nor the link target contains a '..' or an absolute root for
+  // the string-only checks in [CHECKPATH] to reject.  Only an lstat of each
+  // part of the resolved target can catch it.
+  const base = path.resolve(unpackdir, 'link-through-symlink')
+  t.teardown(_ => rimraf.sync(base))
+
+  const outside = path.resolve(base, 'outside')
+  const secret = path.resolve(outside, 'secret.txt')
+
+  // '<cwd>/x' is a real symlink out of the extraction directory, as an
+  // earlier entry of the same archive or a previous extraction can leave
+  // behind.  '<cwd>/realdir' is an ordinary directory, for contrast.
+  const setup = which => {
+    rimraf.sync(base)
+    const cwd = path.resolve(base, which)
+    mkdirp.sync(path.resolve(cwd, 'realdir'))
+    mkdirp.sync(outside)
+    fs.writeFileSync(secret, 'original content')
+    fs.writeFileSync(path.resolve(cwd, 'realdir', 'target.txt'), 'inside')
+    fs.symlinkSync(outside, path.resolve(cwd, 'x'))
+    return cwd
+  }
+
+  const data = makeTar([
+    {
+      path: 'exploit_hard',
+      type: 'Link',
+      linkpath: 'x/secret.txt',
+      mode: 0o644
+    },
+    {
+      path: 'exploit_sym',
+      type: 'SymbolicLink',
+      linkpath: 'x/secret.txt',
+      mode: 0o755
+    },
+    {
+      path: 'ok_hard',
+      type: 'Link',
+      linkpath: 'realdir/target.txt',
+      mode: 0o644
+    },
+    {
+      path: 'ok_sym',
+      type: 'SymbolicLink',
+      linkpath: 'realdir/target.txt',
+      mode: 0o755
+    },
+    '',
+    ''
+  ])
+
+  const symlinkWarning = 'TAR_SYMLINK_ERROR: Cannot extract through symbolic link'
+
+  const check = (t, cwd, warnings) => {
+    t.throws(_ => fs.lstatSync(path.resolve(cwd, 'exploit_hard')),
+      'hardlink through a symlinked directory is not created')
+    t.throws(_ => fs.lstatSync(path.resolve(cwd, 'exploit_sym')),
+      'symlink through a symlinked directory is not created')
+    t.same(warnings, [symlinkWarning, symlinkWarning],
+      'both escaping link entries were refused')
+
+    // a target reached through an ordinary directory is still linked
+    t.ok(fs.lstatSync(path.resolve(cwd, 'ok_hard')).isFile(),
+      'hardlink through a real directory still works')
+    t.ok(fs.lstatSync(path.resolve(cwd, 'ok_sym')).isSymbolicLink(),
+      'symlink through a real directory still works')
+
+    // whatever did land in the extraction dir cannot reach outside of it
+    const exploits = ['exploit_hard', 'exploit_sym']
+    exploits.forEach(f => {
+      try {
+        fs.writeFileSync(path.resolve(cwd, f), 'pwned')
+      } catch (er) {}
+    })
+    t.equal(fs.readFileSync(secret, 'utf8'), 'original content',
+      'the file outside the extraction directory is untouched')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const warnings = []
+    const cwd = setup('async')
+    new Unpack({
+      cwd: cwd,
+      onwarn: msg => warnings.push(msg)
+    }).on('close', _ => check(t, cwd, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const warnings = []
+    const cwd = setup('sync')
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: msg => warnings.push(msg)
+    }).end(data)
+    check(t, cwd, warnings)
+  })
+
+  t.test('preservePaths opts out', t => {
+    const warnings = []
+    const cwd = setup('preserve')
+    new UnpackSync({
+      cwd: cwd,
+      preservePaths: true,
+      onwarn: msg => warnings.push(msg)
+    }).end(data)
+    t.same(warnings, [], 'no link was refused')
+    t.ok(fs.lstatSync(path.resolve(cwd, 'exploit_sym')).isSymbolicLink(),
+      'symlink through the symlinked directory was created')
+    t.ok(fs.lstatSync(path.resolve(cwd, 'exploit_hard')).isFile(),
+      'hardlink through the symlinked directory was created')
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('link through a symlinked \'..\' chain', t => {
+  // The published proof of concept builds its way out of the extraction
+  // directory with a pair of symlinks whose own targets contain '..', and
+  // then links through the resulting chain with a target that does not.
+  // The link targets carrying '..' are refused outright, so the chain is
+  // never built and the final entry has nothing to follow.
+  const base = path.resolve(unpackdir, 'symlink-dotdot-chain')
+  t.teardown(_ => rimraf.sync(base))
+
+  const setup = which => {
+    rimraf.sync(base)
+    const dir = path.resolve(base, which)
+    // the cwd is a child of dir, so the chain lands back on dir itself
+    const cwd = path.resolve(dir, 'x')
+    mkdirp.sync(cwd)
+    fs.writeFileSync(path.resolve(dir, 'exploited-file'), 'original content')
+    return { dir: dir, cwd: cwd }
+  }
+
+  const makeExploit = type => makeTar([
+    {
+      path: 'a/b/up',
+      type: 'SymbolicLink',
+      linkpath: '../..',
+      mode: 0o755
+    },
+    {
+      path: 'a/b/escape',
+      type: 'SymbolicLink',
+      linkpath: 'up/..',
+      mode: 0o755
+    },
+    {
+      path: 'exploit',
+      type: type,
+      linkpath: 'a/b/escape/exploited-file',
+      mode: 0o755
+    },
+    '',
+    ''
+  ])
+
+  const check = (t, c, warnings) => {
+    t.same(warnings.filter(w => /linkpath/.test(w)), [
+      'linkpath contains \'..\'',
+      'linkpath contains \'..\''
+    ], 'both escaping symlinks were refused')
+    t.throws(_ => fs.lstatSync(path.resolve(c.cwd, 'a/b/up')),
+      'the first link of the chain is not created')
+    t.throws(_ => fs.lstatSync(path.resolve(c.cwd, 'a/b/escape')),
+      'the second link of the chain is not created')
+    try {
+      fs.writeFileSync(path.resolve(c.cwd, 'exploit'), 'pwned')
+    } catch (er) {}
+    t.equal(fs.readFileSync(path.resolve(c.dir, 'exploited-file'), 'utf8'),
+      'original content', 'the file outside the extraction dir is untouched')
+    t.end()
+  }
+
+  const types = ['Link', 'SymbolicLink']
+  types.forEach(type => {
+    t.test(type, t => {
+      const exploit = makeExploit(type)
+
+      t.test('async', t => {
+        const warnings = []
+        const c = setup('async-' + type)
+        new Unpack({
+          cwd: c.cwd,
+          onwarn: msg => warnings.push(msg)
+        }).on('close', _ => check(t, c, warnings)).end(exploit)
+      })
+
+      t.test('sync', t => {
+        const warnings = []
+        const c = setup('sync-' + type)
+        new UnpackSync({
+          cwd: c.cwd,
+          onwarn: msg => warnings.push(msg)
+        }).end(exploit)
+        check(t, c, warnings)
+      })
+
+      t.end()
+    })
   })
 
   t.end()

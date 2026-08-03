@@ -362,7 +362,13 @@ t.test('nonexistent file', t => {
 })
 
 t.test('absolute path', t => {
-  const f = path.resolve(files, '512-bytes.txt')
+  const absolute = path.resolve(files, '512-bytes.txt')
+  const root = path.parse(absolute).root
+  // stacking roots up must not leave any of them behind
+  const f = root + root + root + absolute
+  const warn = root + root + root + root
+  t.ok(path.isAbsolute(f))
+  t.ok(path.isAbsolute(absolute))
   t.test('preservePaths=false strict=false', t => {
     const warnings = []
     const ws = new WriteEntry(f, {
@@ -375,13 +381,15 @@ t.test('absolute path', t => {
       out = Buffer.concat(out)
       t.equal(out.length, 1024)
       t.match(warnings, [[
-        /stripping .* from absolute path/, f
+        'stripping ' + warn + ' from absolute path', f
       ]])
 
+      t.notOk(path.isAbsolute(ws.header.path), 'not absolute on posix')
+      t.notOk(path.win32.isAbsolute(ws.header.path), 'not absolute on win32')
       t.match(ws.header, {
         cksumValid: true,
         needPax: false,
-        path: f.replace(/^(\/|[a-z]:\\\\)/, ''),
+        path: f.replace(/^(\/|[a-z]:\\\\){4}/, ''),
         mode: 0o644,
         size: 512,
         linkpath: null,
@@ -391,6 +399,38 @@ t.test('absolute path', t => {
         devmin: 0
       })
       t.end()
+    })
+  })
+
+  t.test('every root is stripped, not just the first', t => {
+    const cases = [
+      ['////etc/passwd', '////', 'etc/passwd'],
+      ['///a/b/c', '///', 'a/b/c'],
+      ['//foo//bar//baz', '//', 'foo//bar//baz'],
+      ['c:///a/b/c', 'c:///', 'a/b/c'],
+      ['//?/c:/a/b/c', '//?/c:/', 'a/b/c']
+    ]
+    t.plan(cases.length)
+    cases.forEach(c => {
+      const p = c[0]
+      const expectRoot = c[1]
+      const expectPath = c[2]
+      t.test(p, t => {
+        const warnings = []
+        const ws = new WriteEntry(p, {
+          cwd: files,
+          absolute: absolute,
+          onwarn: (m, d) => warnings.push([m, d])
+        })
+        t.equal(ws.path, expectPath, 'all roots stripped')
+        t.notOk(path.isAbsolute(ws.path), 'not absolute on posix')
+        t.notOk(path.win32.isAbsolute(ws.path), 'not absolute on win32')
+        t.same(warnings, [[
+          'stripping ' + expectRoot + ' from absolute path', p
+        ]])
+        ws.on('data', _ => _)
+        ws.on('end', _ => t.end())
+      })
     })
   })
 
@@ -1059,7 +1099,45 @@ t.test('write entry from read entry', t => {
         onwarn: (msg, data) => warnings.push(msg, data)
       })
       t.same(warnings, ['stripping / from absolute path', '/a/b/c'])
+      t.equal(wetFile.path, 'a/b/c')
       t.end()
+    })
+
+    t.test('every root is stripped, not just the first', t => {
+      // paths that only had their first root removed used to stay rooted,
+      // and get written into the archive as absolute paths.
+      const cases = [
+        ['/', '/', ''],
+        ['////', '////', ''],
+        ['////etc/passwd', '////', 'etc/passwd'],
+        ['//foo//bar//baz', '//', 'foo//bar//baz'],
+        ['c:///a/b/c', 'c:///', 'a/b/c'],
+        ['//?/c:/a/b/c', '//?/c:/', 'a/b/c'],
+        ['\\\\foo\\bar\\baz', '\\\\foo\\bar\\', 'baz'],
+        ['c:\\c:\\c:\\c:\\\\d:\\e/f/g', 'c:\\c:\\c:\\c:\\\\d:\\', 'e/f/g'],
+        ['c:..\\foo', 'c:', '..\\foo']
+      ]
+      t.plan(cases.length)
+      cases.forEach(c => {
+        const p = c[0]
+        const expectRoot = c[1]
+        const expectPath = c[2]
+        t.test(JSON.stringify(p), t => {
+          const entry = new ReadEntry(new Header(data))
+          entry.path = p
+          const warnings = []
+          const wet = new WriteEntry.Tar(entry, {
+            onwarn: (msg, d) => warnings.push([msg, d])
+          })
+          t.equal(wet.path, expectPath, 'all roots stripped')
+          t.notOk(path.isAbsolute(wet.path), 'not absolute on posix')
+          t.notOk(path.win32.isAbsolute(wet.path), 'not absolute on win32')
+          t.same(warnings, [[
+            'stripping ' + expectRoot + ' from absolute path', p
+          ]])
+          t.end()
+        })
+      })
     })
 
     t.test('preserve', t => {

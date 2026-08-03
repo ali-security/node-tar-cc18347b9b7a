@@ -851,6 +851,120 @@ t.test('absolute paths', t => {
   t.end()
 })
 
+t.test('absolute paths with more than one root', t => {
+  // Stripping only the first root off of a path left paths like
+  // '////home/user/.bashrc' or 'c:/c:/c:/x' absolute, so the entry still
+  // escaped the extraction target.  Every root has to come off, not just
+  // the first one.
+  const dir = path.join(unpackdir, 'absolute-paths-multi-root')
+  const escape = path.join(unpackdir, 'multi-root-escape.txt')
+  t.teardown(_ => {
+    rimraf.sync(dir)
+    rimraf.sync(escape)
+  })
+  t.beforeEach(cb => {
+    rimraf.sync(dir)
+    rimraf.sync(escape)
+    mkdirp.sync(dir)
+    cb()
+  })
+
+  const root = path.parse(escape).root
+  const stacked = root + root + root + escape
+  t.ok(path.isAbsolute(stacked))
+
+  const data = makeTar([
+    {
+      path: stacked,
+      type: 'File',
+      size: 1,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    'a',
+    '',
+    ''
+  ])
+
+  t.test('warn and correct', t => {
+    const warnings = []
+    const check = t => {
+      t.match(warnings, [[
+        /^stripping .* from absolute path$/,
+        stacked
+      ]])
+      t.notOk(fs.existsSync(escape), 'did not escape the extraction target')
+      t.ok(fs.readdirSync(dir).length > 0, 'extracted under the cwd')
+      t.end()
+    }
+
+    t.test('async', t => {
+      warnings.length = 0
+      new Unpack({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(data)
+    })
+
+    t.test('sync', t => {
+      warnings.length = 0
+      new UnpackSync({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t)
+    })
+
+    t.end()
+  })
+
+  t.test('stacked drive roots', t => {
+    const stackedDrive = 'c:/c:/c:/x/y/z'
+    const driveData = makeTar([
+      {
+        path: stackedDrive,
+        type: 'File',
+        size: 1,
+        mtime: new Date('2011-03-27T22:16:31.000Z')
+      },
+      'a',
+      '',
+      ''
+    ])
+
+    const warnings = []
+    const check = t => {
+      t.same(warnings, [[
+        'stripping c:/c:/c:/ from absolute path',
+        stackedDrive
+      ]])
+      t.equal(fs.readFileSync(path.resolve(dir, 'x/y/z'), 'utf8'), 'a')
+      t.notOk(fs.existsSync(path.resolve(dir, 'c:')), 'no root left behind')
+      t.end()
+    }
+
+    t.test('async', t => {
+      warnings.length = 0
+      new Unpack({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(driveData)
+    })
+
+    t.test('sync', t => {
+      warnings.length = 0
+      new UnpackSync({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(driveData)
+      check(t)
+    })
+
+    t.end()
+  })
+
+  t.end()
+})
+
 t.test('.. paths', t => {
   const dir = path.join(unpackdir, 'dotted-paths')
   t.teardown(_ => rimraf.sync(dir))

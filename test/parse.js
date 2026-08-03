@@ -595,3 +595,63 @@ t.test('end while consuming', t => {
   mp.end(data)
   mp.pipe(p)
 })
+
+t.test('pax size does not apply to intermediary extension headers', t => {
+  // CVE-2026-53655: a PAX extended header describes the *next file entry*,
+  // never the GNU long-name/long-link (L/K) or PAX (x/g) headers that may sit
+  // between it and that file.  Honoring the pending `size=1024` record on the
+  // intervening 'L' header makes the parser eat the block that follows it, so
+  // this archive presents a shorter member list to node-tar than it does to
+  // gnu tar/libarchive/python-tarfile, smuggling 'second.txt' past anything
+  // that lists the archive with node-tar. (CWE-436 interpretation conflict.)
+  const longPath = 'long-name.txt'
+  const body = new Array(513).join('a')
+  const data = makeTar([
+    // pax header carrying `size=1024`, which describes the file entry below
+    {
+      path: 'PaxHeader/long-name.txt',
+      type: 'ExtendedHeader',
+      size: 13
+    },
+    '13 size=1024\n',
+    // intermediary GNU long-path header, whose body is exactly one block
+    {
+      path: '././@LongLink',
+      type: 'NextFileHasLongPath',
+      size: 512
+    },
+    longPath,
+    // the file entry that both the pax record and the long name describe
+    {
+      path: 'placeholder',
+      type: 'File',
+      size: 1024
+    },
+    body,
+    body,
+    {
+      path: 'second.txt',
+      type: 'File',
+      size: 0
+    },
+    '',
+    ''
+  ])
+
+  const entries = []
+  const warnings = []
+  const p = new Parse({
+    onwarn: msg => warnings.push(msg)
+  })
+  p.on('entry', entry => {
+    entries.push([entry.path, entry.size])
+    entry.resume()
+  })
+  p.on('end', _ => {
+    t.same(entries, [[longPath, 1024], ['second.txt', 0]],
+           'every member is visible, none smuggled away')
+    t.same(warnings, [], 'blocks stayed in sync')
+    t.end()
+  })
+  p.end(data)
+})

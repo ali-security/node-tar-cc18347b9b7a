@@ -3110,3 +3110,255 @@ t.test('windows path separators are normalized', t => {
 
   t.end()
 })
+
+// 'café' spelled with a composed é (NFC), and with a plain e followed by a
+// combining acute accent (NFD).  A filesystem that squashes unicode, such as
+// macOS', treats the two spellings as one and the same name.
+const nfcCafe = Buffer.from([0x63, 0x61, 0x66, 0xc3, 0xa9]).toString()
+const nfdCafe = Buffer.from([0x63, 0x61, 0x66, 0x65, 0xcc, 0x81]).toString()
+
+t.test('dirCache pruning unicode normalized collisions', t => {
+  // A directory entry is cached under the exact spelling the archive used, so
+  // a symlink spelled the other way took the place of the cached directory
+  // without pruning it.  Cache keys are compared on their maximally
+  // compatible (NFKD, lowercased) representation now, so either spelling of a
+  // name prunes the other.
+  //
+  // Note that the upstream archive's trailing '<nfc>/bar' file entry is left
+  // out here: this filesystem is case sensitive and unicode transparent, so
+  // that entry legitimately re-creates the pruned cache key, which would hide
+  // whether the symlink entry ever pruned it.
+  const base = path.resolve(unpackdir, 'dir-cache-unicode')
+  t.teardown(_ => rimraf.sync(base))
+
+  const data = makeTar([
+    {
+      path: 'foo',
+      type: 'Directory'
+    },
+    {
+      path: 'foo/bar',
+      type: 'File',
+      size: 1
+    },
+    'x',
+    {
+      path: nfcCafe,
+      type: 'Directory'
+    },
+    {
+      path: nfdCafe,
+      type: 'SymbolicLink',
+      linkpath: 'foo'
+    },
+    '',
+    ''
+  ])
+
+  const setup = which => {
+    const dir = base + '/' + which
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    return { dir: dir, dirCache: new Map(), warnings: [] }
+  }
+
+  const check = (t, c) => {
+    t.strictSame(Array.from(c.dirCache.entries()), [
+      [c.dir, true],
+      [c.dir + '/foo', true]
+    ], 'composed dirCache entry was pruned by the decomposed symlink')
+    t.equal(fs.readFileSync(c.dir + '/foo/bar', 'utf8'), 'x',
+      'the symlink target was left alone')
+    t.strictSame(c.warnings, [], 'no warnings')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const c = setup('async')
+    new Unpack({ cwd: c.dir, dirCache: c.dirCache })
+      .on('warn', msg => c.warnings.push(msg))
+      .on('end', _ => check(t, c))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const c = setup('sync')
+    new UnpackSync({ cwd: c.dir, dirCache: c.dirCache })
+      .on('warn', msg => c.warnings.push(msg))
+      .end(data)
+    check(t, c)
+  })
+
+  t.end()
+})
+
+t.test('unicode normalized collision cannot write through a symlink', t => {
+  // A unicode-squashing filesystem cannot hold both spellings of one name, so
+  // the state such a filesystem produces is set up here directly: the
+  // composed spelling is a symlink on disk, while the dirCache still claims
+  // that it, and a child of it, is a directory that was just created.  The
+  // decomposed symlink entry has to prune those stale entries, or the
+  // '<nfc>/ginkoid' entry that follows skips the symlink check and is written
+  // through the link, outside of the extraction target.
+  const base = path.resolve(unpackdir, 'dir-cache-unicode-symlink')
+  t.teardown(_ => rimraf.sync(base))
+
+  const data = makeTar([
+    {
+      path: nfdCafe,
+      type: 'SymbolicLink',
+      linkpath: './y'
+    },
+    {
+      path: nfcCafe + '/ginkoid',
+      type: 'File',
+      size: 'ginkoid'.length
+    },
+    'ginkoid',
+    '',
+    ''
+  ])
+
+  const setup = which => {
+    const dir = base + '/' + which
+    rimraf.sync(dir)
+    mkdirp.sync(dir + '/y')
+    fs.symlinkSync('./y', dir + '/' + nfcCafe)
+    // as though a Directory entry spelled <nfc> had just been created here
+    return {
+      dir: dir,
+      dirCache: new Map([
+        [dir + '/' + nfcCafe, true],
+        [dir + '/' + nfcCafe + '/sub', true]
+      ]),
+      warnings: []
+    }
+  }
+
+  const check = (t, c) => {
+    t.notOk(c.dirCache.has(c.dir + '/' + nfcCafe),
+      'stale unicode-variant dirCache entry was pruned')
+    t.notOk(c.dirCache.has(c.dir + '/' + nfcCafe + '/sub'),
+      'stale unicode-variant child dirCache entry was pruned')
+    t.equal(fs.lstatSync(c.dir + '/' + nfcCafe).isSymbolicLink(), true,
+      'the composed spelling is still the symlink')
+    t.strictSame(fs.readdirSync(c.dir + '/y'), [],
+      'nothing was written through the symlink')
+    t.throws(_ => fs.readFileSync(c.dir + '/' + nfcCafe + '/ginkoid'),
+      { code: 'ENOENT' }, 'the file was not created')
+    t.strictSame(c.warnings, ['Cannot extract through symbolic link'])
+    t.end()
+  }
+
+  t.test('async', t => {
+    const c = setup('async')
+    new Unpack({ cwd: c.dir, dirCache: c.dirCache })
+      .on('warn', msg => c.warnings.push(msg))
+      .on('end', _ => check(t, c))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const c = setup('sync')
+    new UnpackSync({ cwd: c.dir, dirCache: c.dirCache })
+      .on('warn', msg => c.warnings.push(msg))
+      .end(data)
+    check(t, c)
+  })
+
+  t.end()
+})
+
+t.test('dircache prune all on windows when symlink encountered', t => {
+  // On windows every name also has an 8.3 shortname alias, so there is no
+  // reasonable way to tell which cached directory a symlink is about to
+  // shadow.  A symlink to a directory, spelled with a shortname, would
+  // otherwise evade the prune and lead to writes anywhere on the system, so
+  // the whole dirCache is dropped whenever a symlink entry is seen there.
+  // The platform has to be faked, because posix has no shortname aliases.
+  const base = path.resolve(unpackdir, 'dir-cache-win32-symlink')
+  const unpackModule = require.resolve('../lib/unpack.js')
+  const mkdirModule = require.resolve('../lib/mkdir.js')
+  const reload = _ => {
+    delete require.cache[unpackModule]
+    delete require.cache[mkdirModule]
+    return require(unpackModule)
+  }
+
+  process.env.TESTING_TAR_FAKE_PLATFORM = 'win32'
+  const WinUnpack = reload()
+  const WinUnpackSync = WinUnpack.Sync
+  t.teardown(_ => {
+    delete process.env.TESTING_TAR_FAKE_PLATFORM
+    reload()
+    rimraf.sync(base)
+  })
+
+  const data = makeTar([
+    {
+      path: 'foo',
+      type: 'Directory'
+    },
+    {
+      path: 'foo/bar',
+      type: 'File',
+      size: 1
+    },
+    'x',
+    {
+      path: nfcCafe,
+      type: 'Directory'
+    },
+    {
+      path: nfdCafe,
+      type: 'SymbolicLink',
+      linkpath: 'safe/actually/but/cannot/be/too/careful'
+    },
+    {
+      path: 'bar/baz',
+      type: 'File',
+      size: 1
+    },
+    'z',
+    '',
+    ''
+  ])
+
+  const setup = which => {
+    const dir = base + '/' + which
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    return { dir: dir, dirCache: new Map(), warnings: [] }
+  }
+
+  const check = (t, c) => {
+    // the symlink blew away every dirCache entry before it, so only the cwd
+    // and the directory created after it are left
+    t.strictSame(Array.from(c.dirCache.entries()), [
+      [c.dir, true],
+      [c.dir + '/bar', true]
+    ], 'the whole dirCache was dropped by the symlink')
+    t.equal(fs.readFileSync(c.dir + '/foo/bar', 'utf8'), 'x')
+    t.equal(fs.readFileSync(c.dir + '/bar/baz', 'utf8'), 'z')
+    t.strictSame(c.warnings, [], 'no warnings')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const c = setup('async')
+    new WinUnpack({ cwd: c.dir, dirCache: c.dirCache })
+      .on('warn', msg => c.warnings.push(msg))
+      .on('end', _ => check(t, c))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const c = setup('sync')
+    new WinUnpackSync({ cwd: c.dir, dirCache: c.dirCache })
+      .on('warn', msg => c.warnings.push(msg))
+      .end(data)
+    check(t, c)
+  })
+
+  t.end()
+})

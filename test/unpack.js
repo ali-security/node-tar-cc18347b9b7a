@@ -2894,3 +2894,219 @@ t.test('drop entry from dirCache if no longer a directory', t => {
     check(t, path)
   })
 })
+
+t.test('dirCache is pruned case-insensitively', t => {
+  // Directory entries land in the dirCache under the exact case the archive
+  // used, but on a case-insensitive filesystem 'X' and 'x' name the same
+  // entry, so a symlink called 'x' can take the place of the directory that
+  // was cached as 'X'.  Pruning only exact matches left that stale directory
+  // in the cache, so the following 'X/...' entry skipped the symlink check
+  // and was written through the link, outside of the extraction target.
+  //
+  // A case-sensitive filesystem cannot hold both spellings of one name, so
+  // the state a case-insensitive filesystem produces is set up here
+  // directly: '<cwd>/X' is a symlink on disk, while the dirCache still
+  // claims that it, and a child of it, is a directory.
+  const base = path.resolve(unpackdir, 'dir-cache-case-insensitive')
+  t.teardown(_ => rimraf.sync(base))
+
+  const data = makeTar([
+    {
+      path: 'x',
+      type: 'SymbolicLink',
+      linkpath: './y'
+    },
+    {
+      path: 'X/ginkoid',
+      type: 'File',
+      size: 'ginkoid'.length
+    },
+    'ginkoid',
+    '',
+    ''
+  ])
+
+  const setup = which => {
+    const dir = base + '/' + which
+    rimraf.sync(dir)
+    mkdirp.sync(dir + '/y')
+    fs.symlinkSync('./y', dir + '/X')
+    // as though a Directory entry named 'X' had just been created here
+    return {
+      dir: dir,
+      dirCache: new Map([[dir + '/X', true], [dir + '/X/Y', true]]),
+      warnings: []
+    }
+  }
+
+  const check = (t, c) => {
+    t.notOk(c.dirCache.has(c.dir + '/X'),
+      'stale case-variant dirCache entry was pruned')
+    t.notOk(c.dirCache.has(c.dir + '/X/Y'),
+      'stale case-variant child dirCache entry was pruned')
+    t.equal(fs.lstatSync(c.dir + '/X').isSymbolicLink(), true,
+      'X is still the symlink')
+    t.strictSame(fs.readdirSync(c.dir + '/y'), [],
+      'nothing was written through the symlink')
+    t.throws(_ => fs.readFileSync(c.dir + '/X/ginkoid'), { code: 'ENOENT' },
+      'the file was not created')
+    t.strictSame(c.warnings, ['Cannot extract through symbolic link'])
+    t.end()
+  }
+
+  t.test('async', t => {
+    const c = setup('async')
+    new Unpack({ cwd: c.dir, dirCache: c.dirCache })
+      .on('warn', msg => c.warnings.push(msg))
+      .on('end', _ => check(t, c))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const c = setup('sync')
+    new UnpackSync({ cwd: c.dir, dirCache: c.dirCache })
+      .on('warn', msg => c.warnings.push(msg))
+      .end(data)
+    check(t, c)
+  })
+
+  t.end()
+})
+
+t.test('windows path separators are normalized', t => {
+  // On windows both / and \ separate directories, so 'x\\y' and 'x/y' are
+  // the same directory, but the dirCache was keyed by whichever spelling the
+  // archive happened to use.  An entry could therefore poison the cache
+  // under one spelling and then be replaced by a symlink under the other.
+  // Every path that feeds the cache is normalized to / now.  The platform
+  // has to be faked, because on posix \ is a legal filename character and
+  // the normalization is deliberately a no-op there.
+  const base = path.resolve(unpackdir, 'dir-cache-win32-sep')
+  const unpackModule = require.resolve('../lib/unpack.js')
+  const mkdirModule = require.resolve('../lib/mkdir.js')
+  const reload = _ => {
+    delete require.cache[unpackModule]
+    delete require.cache[mkdirModule]
+    return require(unpackModule)
+  }
+
+  process.env.TESTING_TAR_FAKE_PLATFORM = 'win32'
+  const WinUnpack = reload()
+  const WinUnpackSync = WinUnpack.Sync
+  t.teardown(_ => {
+    delete process.env.TESTING_TAR_FAKE_PLATFORM
+    reload()
+    rimraf.sync(base)
+  })
+
+  const setup = which => {
+    const dir = base + '/' + which
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    return { dir: dir, dirCache: new Map(), warnings: [] }
+  }
+
+  t.test('dirCache keys use / for \\-separated entries', t => {
+    const data = makeTar([
+      {
+        path: 'x\\y',
+        type: 'Directory'
+      },
+      {
+        path: 'x\\y\\ginkoid',
+        type: 'File',
+        size: 'ginkoid'.length
+      },
+      'ginkoid',
+      '',
+      ''
+    ])
+
+    const check = (t, c) => {
+      t.strictSame(c.warnings, [], 'no warnings')
+      t.equal(fs.statSync(c.dir + '/x/y').isDirectory(), true,
+        'x/y is a directory')
+      t.equal(fs.readFileSync(c.dir + '/x/y/ginkoid', 'utf8'), 'ginkoid',
+        'file landed in the normalized directory')
+      t.ok(c.dirCache.has(c.dir + '/x/y'),
+        'dirCache key uses / separators')
+      t.notOk(c.dirCache.has(c.dir + '/x\\y'),
+        'no \\-separated key was left behind')
+      t.end()
+    }
+
+    t.test('async', t => {
+      const c = setup('keys-async')
+      new WinUnpack({ cwd: c.dir, dirCache: c.dirCache })
+        .on('warn', msg => c.warnings.push(msg))
+        .on('end', _ => check(t, c))
+        .end(data)
+    })
+
+    t.test('sync', t => {
+      const c = setup('keys-sync')
+      new WinUnpackSync({ cwd: c.dir, dirCache: c.dirCache })
+        .on('warn', msg => c.warnings.push(msg))
+        .end(data)
+      check(t, c)
+    })
+
+    t.end()
+  })
+
+  t.test('prune matches across separators', t => {
+    // 'x/y' is cached as a directory, then a symlink spelled 'x\\y' takes
+    // its place.  Without normalization the two spellings did not match, the
+    // cache entry survived, and 'x/y/ginkoid' was written through the link.
+    const data = makeTar([
+      {
+        path: 'x/y',
+        type: 'Directory'
+      },
+      {
+        path: 'x\\y',
+        type: 'SymbolicLink',
+        linkpath: './z'
+      },
+      {
+        path: 'x/y/ginkoid',
+        type: 'File',
+        size: 'ginkoid'.length
+      },
+      'ginkoid',
+      '',
+      ''
+    ])
+
+    const check = (t, c) => {
+      t.equal(fs.lstatSync(c.dir + '/x/y').isSymbolicLink(), true,
+        'the \\-separated symlink replaced x/y')
+      t.notOk(c.dirCache.has(c.dir + '/x/y'),
+        'poisoned dirCache entry was pruned')
+      t.throws(_ => fs.readFileSync(c.dir + '/x/y/ginkoid'), { code: 'ENOENT' },
+        'the file was not written through the symlink')
+      t.strictSame(c.warnings, ['Cannot extract through symbolic link'])
+      t.end()
+    }
+
+    t.test('async', t => {
+      const c = setup('prune-async')
+      new WinUnpack({ cwd: c.dir, dirCache: c.dirCache })
+        .on('warn', msg => c.warnings.push(msg))
+        .on('end', _ => check(t, c))
+        .end(data)
+    })
+
+    t.test('sync', t => {
+      const c = setup('prune-sync')
+      new WinUnpackSync({ cwd: c.dir, dirCache: c.dirCache })
+        .on('warn', msg => c.warnings.push(msg))
+        .end(data)
+      check(t, c)
+    })
+
+    t.end()
+  })
+
+  t.end()
+})

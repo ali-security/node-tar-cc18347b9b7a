@@ -2,6 +2,8 @@
 
 const t = require('tap')
 const x = require('../lib/extract.js')
+const Pax = require('../lib/pax.js')
+const makeTar = require('./make-tar.js')
 const path = require('path')
 const fs = require('fs')
 const extractdir = path.resolve(__dirname, 'fixtures/extract')
@@ -233,3 +235,60 @@ t.test('sync gzip error edge case test', t => {
 
   t.end()
 })
+
+// A PAX header entry with a numeric-looking path (e.g. "12345") must be
+// extracted as a file named "12345", not crash or skip, in strict and non-strict.
+const makePaxExtractData = (paxName, entryName) => {
+  const paxHeader = new Pax({ path: paxName, size: '12345\n'.length }, false)
+  const paxData = paxHeader.encode()
+  return makeTar([
+    paxData,
+    {
+      type: 'File',
+      path: entryName,
+      mode: 0o755,
+      ctime: new Date('2000-01-01T00:00:00.000Z'),
+      mtime: new Date('2000-01-01T00:00:00.000Z'),
+      size: '12345\n'.length
+    },
+    '12345\n',
+    '',
+    ''
+  ])
+}
+
+const paxNameDir = (which, data) => {
+  const dir = path.resolve(extractdir, 'numeric-pax-name-' + which)
+  rimraf.sync(dir)
+  mkdirp.sync(dir)
+  fs.writeFileSync(dir + '/tarFile', data)
+  return dir
+}
+
+for (const strict of [true, false]) {
+  for (const paxName of ['12345', 'abcde']) {
+    for (const entryName of ['12345', 'abcde']) {
+      const label = 'numeric pax/entry name discernment strict=' + strict +
+        ' paxName=' + paxName + ' entryName=' + entryName
+      const which = strict + '-' + paxName + '-' + entryName
+      const data = makePaxExtractData(paxName, entryName)
+
+      t.test(label + ' sync', t => {
+        const dir = paxNameDir(which + '-sync', data)
+        t.teardown(_ => rimraf.sync(dir))
+        x({ strict: strict, sync: true, cwd: dir, file: dir + '/tarFile' })
+        t.equal(fs.readFileSync(dir + '/' + paxName, 'utf8'), '12345\n')
+        t.end()
+      })
+
+      t.test(label + ' async', t => {
+        const dir = paxNameDir(which + '-async', data)
+        t.teardown(_ => rimraf.sync(dir))
+        x({ strict: strict, cwd: dir, file: dir + '/tarFile' }).then(_ => {
+          t.equal(fs.readFileSync(dir + '/' + paxName, 'utf8'), '12345\n')
+          t.end()
+        })
+      })
+    }
+  }
+}

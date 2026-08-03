@@ -8,6 +8,7 @@ const t = require('tap')
 const MiniPass = require('minipass')
 
 const makeTar = require('./make-tar.js')
+const Pax = require('../lib/pax.js')
 const Header = require('../lib/header.js')
 const z = require('minizlib')
 const fs = require('fs')
@@ -3789,4 +3790,150 @@ t.test('link through a symlinked \'..\' chain', t => {
   })
 
   t.end()
+})
+
+// Helper for 'numeric pax/entry name discernment' test:
+// A PAX header entry with a numeric-looking path (e.g. "12345") must be
+// extracted as a file named "12345", not crash or skip, in strict and non-strict.
+const makePaxNameData = (paxName, entryName) => {
+  const paxHeader = new Pax({ path: paxName, size: '12345\n'.length }, false)
+  const paxData = paxHeader.encode()
+  return makeTar([
+    paxData,
+    {
+      type: 'File',
+      path: entryName,
+      mode: 0o755,
+      ctime: new Date('2000-01-01T00:00:00.000Z'),
+      mtime: new Date('2000-01-01T00:00:00.000Z'),
+      size: '12345\n'.length
+    },
+    '12345\n',
+    '',
+    ''
+  ])
+}
+
+const paxNameDir = which => {
+  const dir = path.resolve(unpackdir, 'numeric-pax-name-' + which)
+  rimraf.sync(dir)
+  mkdirp.sync(dir)
+  return dir
+}
+
+for (const strict of [true, false]) {
+  for (const paxName of ['12345', 'abcde']) {
+    for (const entryName of ['12345', 'abcde']) {
+      const label = 'numeric pax/entry name discernment strict=' + strict +
+        ' paxName=' + paxName + ' entryName=' + entryName
+      const which = strict + '-' + paxName + '-' + entryName
+      const data = makePaxNameData(paxName, entryName)
+
+      t.test(label + ' sync', t => {
+        const cwd = paxNameDir(which + '-sync')
+        t.teardown(_ => rimraf.sync(cwd))
+        new UnpackSync({ strict: strict, cwd: cwd }).end(data)
+        t.equal(fs.readFileSync(cwd + '/' + paxName, 'utf8'), '12345\n')
+        t.end()
+      })
+
+      t.test(label + ' async', t => {
+        const cwd = paxNameDir(which + '-async')
+        t.teardown(_ => rimraf.sync(cwd))
+        new Unpack({ strict: strict, cwd: cwd }).on('end', _ => {
+          t.equal(fs.readFileSync(cwd + '/' + paxName, 'utf8'), '12345\n')
+          t.end()
+        }).end(data)
+      })
+    }
+  }
+}
+
+// The advisory's proof of concept puts the all-digit pax path on a Directory
+// entry, and notes that neither strict:false nor an onwarn handler can catch
+// the resulting TypeError, since it is thrown synchronously while the entry
+// event is being emitted.
+const makePaxDirData = _ => {
+  const paxData = new Pax({ path: '12345' }, false).encode()
+  return makeTar([
+    paxData,
+    {
+      type: 'Directory',
+      path: 'dir',
+      mode: 0o755,
+      ctime: new Date('2000-01-01T00:00:00.000Z'),
+      mtime: new Date('2000-01-01T00:00:00.000Z'),
+      size: 0
+    },
+    '',
+    ''
+  ])
+}
+
+const paxDirData = makePaxDirData()
+
+t.test('numeric pax path on a directory entry sync', t => {
+  const cwd = paxNameDir('dir-sync')
+  t.teardown(_ => rimraf.sync(cwd))
+  new UnpackSync({ cwd: cwd }).end(paxDirData)
+  t.ok(fs.lstatSync(cwd + '/12345').isDirectory(), 'made the directory')
+  t.end()
+})
+
+t.test('numeric pax path on a directory entry async', t => {
+  const cwd = paxNameDir('dir-async')
+  t.teardown(_ => rimraf.sync(cwd))
+  new Unpack({ cwd: cwd }).on('end', _ => {
+    t.ok(fs.lstatSync(cwd + '/12345').isDirectory(), 'made the directory')
+    t.end()
+  }).end(paxDirData)
+})
+
+// A pax header retypes an entry's link target just as easily as its own path.
+// A numeric-looking linkpath has to arrive as the string '12345', because
+// every consumer of it (path.win32.parse in the '..' check, path.resolve on
+// the way to fs.symlink) only accepts strings.
+// Header.decode() reads linkpath out of the block *after* its own pax slurp,
+// so the block still needs a placeholder target to get past parse.js'
+// 'linkpath required' check; the pax value is applied by ReadEntry.
+const makePaxLinkData = _ => {
+  const paxData = new Pax({
+    path: 'symlink',
+    linkpath: '12345'
+  }, false).encode()
+  return makeTar([
+    paxData,
+    {
+      type: 'SymbolicLink',
+      path: 'symlink',
+      linkpath: 'placeholder',
+      mode: 0o755,
+      ctime: new Date('2000-01-01T00:00:00.000Z'),
+      mtime: new Date('2000-01-01T00:00:00.000Z'),
+      size: 0
+    },
+    '',
+    ''
+  ])
+}
+
+const paxLinkData = makePaxLinkData()
+
+t.test('numeric pax linkpath stays a string sync', t => {
+  const cwd = paxNameDir('link-sync')
+  t.teardown(_ => rimraf.sync(cwd))
+  new UnpackSync({ cwd: cwd }).end(paxLinkData)
+  t.ok(fs.lstatSync(cwd + '/symlink').isSymbolicLink(), 'got a symlink')
+  t.equal(fs.readlinkSync(cwd + '/symlink'), '12345')
+  t.end()
+})
+
+t.test('numeric pax linkpath stays a string async', t => {
+  const cwd = paxNameDir('link-async')
+  t.teardown(_ => rimraf.sync(cwd))
+  new Unpack({ cwd: cwd }).on('end', _ => {
+    t.ok(fs.lstatSync(cwd + '/symlink').isSymbolicLink(), 'got a symlink')
+    t.equal(fs.readlinkSync(cwd + '/symlink'), '12345')
+    t.end()
+  }).end(paxLinkData)
 })

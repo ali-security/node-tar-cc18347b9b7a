@@ -313,3 +313,58 @@ t.test('no negative size', t => {
   })
   t.end()
 })
+
+t.test('string fields stay string', t => {
+  const parsed = Pax.parse(
+    '14 path=12345\n18 linkpath=54321\n13 WAT=12345\n15 ctime=12345\n'
+  )
+  t.same(parsed, {
+    atime: null,
+    charset: null,
+    comment: null,
+    ctime: new Date('1970-01-01T03:25:45.000Z'),
+    gid: null,
+    gname: null,
+    linkpath: '54321',
+    mtime: null,
+    path: '12345',
+    size: null,
+    uid: null,
+    uname: null,
+    dev: null,
+    ino: null,
+    nlink: null,
+    global: false
+  })
+  // t.same() is a loose compare, and 12345 == '12345', so the deep compare
+  // above passes even when the value got coerced to a Number.  The whole
+  // point of the fix is the *type*, so assert that directly.
+  t.equal(typeof parsed.path, 'string', 'path is a string')
+  t.equal(typeof parsed.linkpath, 'string', 'linkpath is a string')
+  t.ok(parsed.ctime instanceof Date, 'ctime is a Date')
+  t.equal(parsed.ctime.getTime(), 12345000, 'ctime parsed as unix seconds')
+  t.notOk('WAT' in parsed, 'unknown keyword is dropped')
+  t.end()
+})
+
+t.test('every field gets the type its keyword says', t => {
+  const parsed = Pax.parse(
+    '15 uname=12345\n15 gname=54321\n11 uid=123\n11 gid=456\n' +
+    '18 SCHILY.dev=789\n13 size=1234\n'
+  )
+  // string-typed keywords keep their digits as text ...
+  t.equal(typeof parsed.uname, 'string', 'uname is a string')
+  t.equal(parsed.uname, '12345')
+  t.equal(typeof parsed.gname, 'string', 'gname is a string')
+  t.equal(parsed.gname, '54321')
+  // ... while number-typed keywords are still numbers.
+  t.equal(typeof parsed.uid, 'number', 'uid is a number')
+  t.equal(parsed.uid, 123)
+  t.equal(typeof parsed.gid, 'number', 'gid is a number')
+  t.equal(parsed.gid, 456)
+  t.equal(typeof parsed.dev, 'number', 'dev is a number')
+  t.equal(parsed.dev, 789)
+  t.equal(typeof parsed.size, 'number', 'size is a number')
+  t.equal(parsed.size, 1234)
+  t.end()
+})

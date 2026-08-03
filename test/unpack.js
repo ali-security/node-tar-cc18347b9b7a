@@ -21,6 +21,7 @@ const rimraf = require('rimraf')
 const mkdirp = require('mkdirp')
 const mutateFS = require('mutate-fs')
 const eos = require('end-of-stream')
+const ReadEntry = require('../lib/read-entry.js')
 
 t.teardown(_ => rimraf.sync(unpackdir))
 
@@ -3358,6 +3359,80 @@ t.test('dircache prune all on windows when symlink encountered', t => {
       .on('warn', msg => c.warnings.push(msg))
       .end(data)
     check(t, c)
+  })
+
+  t.end()
+})
+
+t.test('excessively deep subfolder nesting', t => {
+  const tf = path.resolve(fixtures, 'excessively-deep.tar')
+  const data = fs.readFileSync(tf)
+  const base = path.resolve(unpackdir, 'excessively-deep')
+  t.teardown(_ => rimraf.sync(base))
+
+  const warnings = []
+  const onwarn = (msg, d) => warnings.push([msg, d])
+
+  const setup = which => {
+    const dir = path.resolve(base, which)
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    return dir
+  }
+
+  const check = (t, cwd, maxDepth) => {
+    if (maxDepth === undefined)
+      maxDepth = 1024
+    t.match(warnings, [
+      [
+        'path excessively deep',
+        {
+          entry: ReadEntry,
+          path: /^\.(\/a){1024,}\/foo.txt$/,
+          depth: 222372,
+          maxDepth: maxDepth
+        }
+      ]
+    ])
+    t.strictSame(fs.readdirSync(cwd), [], 'nothing was extracted')
+    warnings.length = 0
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    new Unpack({
+      cwd: cwd,
+      onwarn: onwarn
+    }).on('end', _ => check(t, cwd)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: onwarn
+    }).end(data)
+    check(t, cwd)
+  })
+
+  t.test('async set md', t => {
+    const cwd = setup('async-set-md')
+    new Unpack({
+      cwd: cwd,
+      onwarn: onwarn,
+      maxDepth: 64
+    }).on('end', _ => check(t, cwd, 64)).end(data)
+  })
+
+  t.test('sync set md', t => {
+    const cwd = setup('sync-set-md')
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: onwarn,
+      maxDepth: 64
+    }).end(data)
+    check(t, cwd, 64)
   })
 
   t.end()

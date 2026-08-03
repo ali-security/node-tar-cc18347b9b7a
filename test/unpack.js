@@ -11,6 +11,7 @@ const makeTar = require('./make-tar.js')
 const Header = require('../lib/header.js')
 const z = require('minizlib')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 const fixtures = path.resolve(__dirname, 'fixtures')
 const files = path.resolve(fixtures, 'files')
@@ -1212,7 +1213,7 @@ t.test('drive-relative symlink targets', t => {
     const warnings = []
     const check = t => {
       t.same(warnings, escapes.map(e =>
-        ['linkpath escapes extraction directory', e.linkpath]),
+        ['linkpath contains \'..\'', e.linkpath]),
         'every escaping symlink target is rejected')
       escapes.forEach(e => t.throws(
         _ => fs.lstatSync(path.resolve(dir, e.path)),
@@ -1241,9 +1242,12 @@ t.test('drive-relative symlink targets', t => {
     t.end()
   })
 
-  t.test('drive-relative target that stays inside is preserved', t => {
-    // 'a/b/ok' -> 'c:..\foo\bar' resolves to 'a/foo/bar', which is still
-    // inside the extraction directory, so it must not be rejected.
+  t.test('drive-relative target is rejected even when it stays inside', t => {
+    // 'a/b/ok' -> 'c:..\foo\bar' resolves to 'a/foo/bar', which happens to
+    // stay inside the extraction directory, but linkpath is now sanitized
+    // exactly like path: stripping the drive root exposes the '..', and any
+    // '..' in a link target is rejected outright, the same way it always
+    // has been for the entry's own path.
     const inside = 'a/b/ok'
     const linkpath = 'c:..\\foo\\bar'
     const insideData = makeTar([
@@ -1259,10 +1263,11 @@ t.test('drive-relative symlink targets', t => {
 
     const warnings = []
     const check = t => {
-      t.same(warnings, [], 'no warning for a target that stays inside')
-      const abs = path.resolve(dir, inside)
-      t.ok(fs.lstatSync(abs).isSymbolicLink(), 'symlink is created')
-      t.equal(fs.readlinkSync(abs), linkpath, 'linkpath is not modified')
+      t.same(warnings, [['linkpath contains \'..\'', linkpath]],
+        'drive-relative target is rejected')
+      t.throws(_ => fs.lstatSync(path.resolve(dir, inside)),
+        'symlink is not created')
+      t.same(fs.readdirSync(dir), [], 'nothing was extracted')
       t.end()
     }
 
@@ -3433,6 +3438,140 @@ t.test('excessively deep subfolder nesting', t => {
       maxDepth: 64
     }).end(data)
     check(t, cwd, 64)
+  })
+
+  t.end()
+})
+
+t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', t => {
+  // A link target was never sanitized at all.  An absolute hardlink target
+  // defeats the path.resolve(this.cwd, entry.linkpath) in [HARDLINK],
+  // because resolve ignores the cwd entirely when the linkpath is already
+  // absolute, so the hardlink lands on any file on the system, and writing
+  // through the extracted entry then clobbers it.  A symlink target was
+  // handed to fs.symlink() verbatim, so an absolute or '..'-bearing target
+  // pointed wherever it liked.  Both happened with preservePaths:false.
+  //
+  // The linkname field of a tar header is only 100 bytes, and the absolute
+  // target has to survive the header intact, so this one test works in a
+  // short directory of its own rather than under the fixtures tree
+  const dir = path.resolve(os.tmpdir(), 'tar-ghsa-8qq5-rm4j-mr97')
+  const secretFile = path.resolve(dir, 'secret.txt')
+  t.teardown(_ => rimraf.sync(dir))
+
+  // the cwd is a direct child of dir, so '../secret.txt' reaches the secret
+  // file just as surely as its absolute path does
+  const setup = which => {
+    rimraf.sync(dir)
+    const cwd = path.resolve(dir, which)
+    mkdirp.sync(cwd)
+    fs.writeFileSync(secretFile, 'ORIGINAL DATA')
+    return cwd
+  }
+
+  const targetSym = '/some/absolute/path'
+  const secretRoot = path.win32.parse(secretFile).root
+
+  const data = makeTar([
+    {
+      path: 'exploit_hard',
+      type: 'Link',
+      linkpath: secretFile,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    {
+      path: 'exploit_sym',
+      type: 'SymbolicLink',
+      linkpath: targetSym,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    {
+      path: 'exploit_hard_dots',
+      type: 'Link',
+      linkpath: '../secret.txt',
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    {
+      path: 'exploit_sym_dots',
+      type: 'SymbolicLink',
+      linkpath: '../../secret.txt',
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    {
+      path: 'ok_sym',
+      type: 'SymbolicLink',
+      linkpath: 'inside/target',
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    '',
+    ''
+  ])
+
+  const warnings = []
+  const onwarn = (msg, d) => warnings.push([msg, d])
+
+  const check = (t, cwd) => {
+    // failing to link the sanitized (and now nonexistent) target is reported
+    // asynchronously, so only the linkpath warnings are predictably ordered
+    t.same(warnings.filter(w => /linkpath/.test(w[0])), [
+      ['stripping ' + secretRoot + ' from absolute linkpath', secretFile],
+      ['stripping / from absolute linkpath', targetSym],
+      ['linkpath contains \'..\'', '../secret.txt'],
+      ['linkpath contains \'..\'', '../../secret.txt']
+    ], 'every escaping link target is stripped or rejected')
+
+    // the absolute hardlink target is relativized, so it resolves inside the
+    // extraction directory, where there is nothing to link to
+    t.throws(_ => fs.lstatSync(path.resolve(cwd, 'exploit_hard')),
+      'hardlink to an absolute target is not created')
+    t.throws(_ => fs.lstatSync(path.resolve(cwd, 'exploit_hard_dots')),
+      'hardlink to a \'..\' target is not created')
+    t.throws(_ => fs.lstatSync(path.resolve(cwd, 'exploit_sym_dots')),
+      'symlink to a \'..\' target is not created')
+
+    // the absolute symlink target is relativized, so following it can only
+    // ever land inside the extraction directory
+    const symPath = path.resolve(cwd, 'exploit_sym')
+    t.notEqual(fs.readlinkSync(symPath), targetSym,
+      'symlink does not point outside the extraction directory')
+    t.equal(fs.readlinkSync(symPath), targetSym.substr(1),
+      'absolute symlink target is relativized')
+
+    // an ordinary relative target is still left exactly as it was
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'ok_sym')), 'inside/target',
+      'ordinary link target is not modified')
+
+    // whatever did get extracted, writing to it cannot reach the secret
+    const hardlinks = ['exploit_hard', 'exploit_hard_dots']
+    hardlinks.forEach(f => {
+      try {
+        fs.writeFileSync(path.resolve(cwd, f), 'OVERWRITTEN')
+      } catch (er) {}
+    })
+    t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA',
+      'no hardlink points at the secret file')
+
+    warnings.length = 0
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    new Unpack({
+      cwd: cwd,
+      preservePaths: false,
+      onwarn: onwarn
+    }).on('close', _ => check(t, cwd)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    new UnpackSync({
+      cwd: cwd,
+      preservePaths: false,
+      onwarn: onwarn
+    }).end(data)
+    check(t, cwd)
   })
 
   t.end()

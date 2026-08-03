@@ -949,6 +949,119 @@ t.test('.. paths', t => {
   t.end()
 })
 
+t.test('drive-relative paths', t => {
+  // A windows drive-relative path like 'c:..\foo' is not "absolute"
+  // according to path.win32.isAbsolute(), so its root was never stripped,
+  // and the '..' hid from the dotted-path check because it is preceded by
+  // a ':' rather than a path separator.  On windows such a path is still
+  // resolved against the drive's current directory, so it escapes the
+  // extraction target.
+  const dir = path.join(unpackdir, 'drive-relative-paths')
+  t.teardown(_ => rimraf.sync(dir))
+  t.beforeEach(cb => {
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    cb()
+  })
+
+  const escapes = [
+    'c:..\\foo\\bar',
+    'c:../foo/bar',
+    'C:..\\..\\..\\foo\\bar',
+    '/c:../foo/bar',
+    'c:..'
+  ]
+
+  const chunks = []
+  escapes.forEach(p => {
+    chunks.push({
+      path: p,
+      type: 'File',
+      size: 1,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    })
+    chunks.push('a')
+  })
+  chunks.push('')
+  chunks.push('')
+  const data = makeTar(chunks)
+
+  t.test('warn and skip', t => {
+    const warnings = []
+    const check = t => {
+      t.same(warnings, escapes.map(p => ['path contains \'..\'', p]),
+        'every drive-relative escape is rejected')
+      t.same(fs.readdirSync(dir), [], 'nothing was extracted')
+      t.end()
+    }
+
+    t.test('async', t => {
+      warnings.length = 0
+      new Unpack({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(data)
+    })
+
+    t.test('sync', t => {
+      warnings.length = 0
+      new UnpackSync({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t)
+    })
+
+    t.end()
+  })
+
+  t.test('drive-absolute paths are still just relativized', t => {
+    const absolute = 'c:/x/y/z'
+    const absData = makeTar([
+      {
+        path: absolute,
+        type: 'File',
+        size: 1,
+        mtime: new Date('2011-03-27T22:16:31.000Z')
+      },
+      'a',
+      '',
+      ''
+    ])
+
+    const warnings = []
+    const check = t => {
+      t.same(warnings, [[
+        'stripping c:/ from absolute path',
+        absolute
+      ]])
+      t.equal(fs.readFileSync(path.resolve(dir, 'x/y/z'), 'utf8'), 'a')
+      t.end()
+    }
+
+    t.test('async', t => {
+      warnings.length = 0
+      new Unpack({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(absData)
+    })
+
+    t.test('sync', t => {
+      warnings.length = 0
+      new UnpackSync({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(absData)
+      check(t)
+    })
+
+    t.end()
+  })
+
+  t.end()
+})
+
 t.test('fail all stats', t => {
   const poop = new Error('poop')
   poop.code = 'EPOOP'

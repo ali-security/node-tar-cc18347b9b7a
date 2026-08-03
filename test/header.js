@@ -606,3 +606,28 @@ t.test('do not apply ex/gex to meta entries', t => {
 
   t.end()
 })
+
+t.test('no negative size', t => {
+  const i = new Header({ size: -1000 })
+  // stubbornly refuse
+  t.equal(i.size, null)
+
+  // a negative size is encodable in a header block as a base-256 number,
+  // and such a block can still carry a perfectly valid checksum.
+  const neg = new Header({ path: 'x', type: 'File', size: 1 })
+  neg.size = -512
+  neg.encode()
+  const decoded = new Header(neg.block)
+  t.equal(decoded.cksumValid, true, 'malformed block is otherwise valid')
+  t.equal(decoded.size, null, 'refuse negative size from the header block')
+
+  // and it can be smuggled in through an extended header as well
+  const ok = new Header({ path: 'x', type: 'File', size: 1 })
+  ok.encode()
+  t.equal(new Header(ok.block, 0, { size: -1000 }).size, null,
+    'refuse negative size from an extended header')
+  t.equal(new Header(ok.block, 0, null, { size: -1000 }).size, null,
+    'refuse negative size from a global extended header')
+
+  t.end()
+})

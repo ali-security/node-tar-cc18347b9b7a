@@ -8,6 +8,7 @@ const mkdirp = require('mkdirp')
 const rimraf = require('rimraf')
 const mutateFS = require('mutate-fs')
 const list = require('../lib/list.js')
+const Header = require('../lib/header.js')
 
 const fixtures = path.resolve(__dirname, 'fixtures')
 const dir = path.resolve(fixtures, 'replace')
@@ -338,6 +339,66 @@ t.test('create tarball out of another tarball', t => {
       f: out,
       cwd: tars
     }, ['@utf8.tar'], _ => check(t))
+  })
+
+  t.end()
+})
+
+t.test('do not hang on a negative entry size', t => {
+  // The scanner that looks for the end of the archive jumps ahead by the
+  // size of each entry's body.  A negative size makes that jump zero or
+  // backwards, so it reads the same block over and over, forever.
+  const fileNegativeSize = dir + '/negative-size.tar'
+
+  const setup = cb => {
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    // assign the size directly, since Header refuses to set a negative one
+    const h = new Header({ path: 'negative-size.txt', type: 'File', size: 1 })
+    h.size = -512
+    h.encode()
+    fs.writeFileSync(fileNegativeSize, Buffer.concat([
+      h.block,
+      Buffer.alloc(1024)
+    ], 1536))
+    if (cb)
+      cb()
+  }
+
+  const check = t => {
+    // no valid body length, so the appended entry lands on the next block
+    const data = fs.readFileSync(fileNegativeSize)
+    t.equal(new Header(data, 512).path, path.basename(__filename))
+    t.end()
+  }
+
+  t.beforeEach(setup)
+
+  t.test('sync', t => {
+    r({
+      sync: true,
+      file: fileNegativeSize,
+      cwd: __dirname
+    }, [path.basename(__filename)])
+    check(t)
+  })
+
+  t.test('async cb', t => {
+    r({
+      file: fileNegativeSize,
+      cwd: __dirname
+    }, [path.basename(__filename)], er => {
+      if (er)
+        throw er
+      check(t)
+    })
+  })
+
+  t.test('async promise', t => {
+    r({
+      file: fileNegativeSize,
+      cwd: __dirname
+    }, [path.basename(__filename)]).then(_ => check(t))
   })
 
   t.end()

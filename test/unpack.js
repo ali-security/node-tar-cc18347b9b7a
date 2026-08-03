@@ -1062,6 +1062,118 @@ t.test('drive-relative paths', t => {
   t.end()
 })
 
+t.test('drive-relative symlink targets', t => {
+  // A symlink target is resolved against the directory the link lives in,
+  // so a windows drive-relative target like 'c:..\foo\bar' walks out of the
+  // extraction directory once the drive root resolves.  The root hid the
+  // '..' from every path check, because the check only ever looked at
+  // entry.path, and linkpath was never examined at all.
+  const dir = path.join(unpackdir, 'drive-relative-linkpaths')
+  t.teardown(_ => rimraf.sync(dir))
+  t.beforeEach(cb => {
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    cb()
+  })
+
+  const escapes = [
+    { path: 'a/winrootdotsescapelink', linkpath: 'c:..\\..\\..\\..\\foo\\bar' },
+    { path: 'winrootdotslink', linkpath: 'c:..' },
+    { path: 'winrootslashlink', linkpath: 'c:../foo/bar' },
+    { path: 'a/b/doublerootlink', linkpath: '/c:../../../foo/bar' }
+  ]
+
+  const chunks = escapes.map(e => ({
+    path: e.path,
+    type: 'SymbolicLink',
+    linkpath: e.linkpath,
+    mtime: new Date('2011-03-27T22:16:31.000Z')
+  }))
+  chunks.push('')
+  chunks.push('')
+  const data = makeTar(chunks)
+
+  t.test('warn and skip', t => {
+    const warnings = []
+    const check = t => {
+      t.same(warnings, escapes.map(e =>
+        ['linkpath escapes extraction directory', e.linkpath]),
+        'every escaping symlink target is rejected')
+      escapes.forEach(e => t.throws(
+        _ => fs.lstatSync(path.resolve(dir, e.path)),
+        'escaping symlink is not created'))
+      t.same(fs.readdirSync(dir), [], 'nothing was extracted')
+      t.end()
+    }
+
+    t.test('async', t => {
+      warnings.length = 0
+      new Unpack({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(data)
+    })
+
+    t.test('sync', t => {
+      warnings.length = 0
+      new UnpackSync({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t)
+    })
+
+    t.end()
+  })
+
+  t.test('drive-relative target that stays inside is preserved', t => {
+    // 'a/b/ok' -> 'c:..\foo\bar' resolves to 'a/foo/bar', which is still
+    // inside the extraction directory, so it must not be rejected.
+    const inside = 'a/b/ok'
+    const linkpath = 'c:..\\foo\\bar'
+    const insideData = makeTar([
+      {
+        path: inside,
+        type: 'SymbolicLink',
+        linkpath: linkpath,
+        mtime: new Date('2011-03-27T22:16:31.000Z')
+      },
+      '',
+      ''
+    ])
+
+    const warnings = []
+    const check = t => {
+      t.same(warnings, [], 'no warning for a target that stays inside')
+      const abs = path.resolve(dir, inside)
+      t.ok(fs.lstatSync(abs).isSymbolicLink(), 'symlink is created')
+      t.equal(fs.readlinkSync(abs), linkpath, 'linkpath is not modified')
+      t.end()
+    }
+
+    t.test('async', t => {
+      warnings.length = 0
+      new Unpack({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(insideData)
+    })
+
+    t.test('sync', t => {
+      warnings.length = 0
+      new UnpackSync({
+        cwd: dir,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(insideData)
+      check(t)
+    })
+
+    t.end()
+  })
+
+  t.end()
+})
+
 t.test('fail all stats', t => {
   const poop = new Error('poop')
   poop.code = 'EPOOP'
